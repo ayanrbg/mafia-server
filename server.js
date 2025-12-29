@@ -1613,6 +1613,274 @@ wss.on('connection', ws => {
                     }
                 });
             }
+            if (data.type === "search_users") {
+                const query = data.query?.trim();
+                if (!query || query.length < 2) {
+                    return ws.send(JSON.stringify({
+                        type: "search_users_result",
+                        users: []
+                    }));
+                }
+
+                const result = await db.query(
+                    `
+                    SELECT id AS user_id, username, avatar_id
+                    FROM users
+                    WHERE LOWER(username) LIKE LOWER($1)
+                    AND id != $2
+                    LIMIT 20
+                    `,
+                    [`%${query}%`, ws.userId]
+                );
+
+                ws.send(JSON.stringify({
+                    type: "search_users_result",
+                    users: result.rows
+                }));
+            }
+            if (data.type === "send_friend_request") {
+                const toUserId = Number(data.to_user_id);
+                if (!toUserId || toUserId === ws.userId) return;
+
+                // уже друзья?
+                const alreadyFriends = await db.query(
+                    `SELECT 1 FROM friends WHERE user_id=$1 AND friend_id=$2`,
+                    [ws.userId, toUserId]
+                );
+                if (alreadyFriends.rows.length > 0) {
+                    return ws.send(JSON.stringify({
+                        type: "friend_request_failed",
+                        message: "Вы уже друзья"
+                    }));
+                }
+
+                // уже есть заявка?
+                const exists = await db.query(
+                    `
+                    SELECT 1 FROM friend_requests
+                    WHERE from_user_id=$1 AND to_user_id=$2 AND status='pending'
+                    `,
+                    [ws.userId, toUserId]
+                );
+                if (exists.rows.length > 0) {
+                    return ws.send(JSON.stringify({
+                        type: "friend_request_failed",
+                        message: "Заявка уже отправлена"
+                    }));
+                }
+
+                await db.query(
+                    `
+                    INSERT INTO friend_requests (from_user_id, to_user_id)
+                    VALUES ($1, $2)
+                    `,
+                    [ws.userId, toUserId]
+                );
+
+                // уведомляем получателя если онлайн
+                const targetWs = [...wss.clients].find(c => c.userId === toUserId);
+                if (targetWs) {
+                    const userRes = await db.query(
+                        `SELECT id AS user_id, username, avatar_id FROM users WHERE id=$1`,
+                        [ws.userId]
+                    );
+
+                    targetWs.send(JSON.stringify({
+                        type: "friend_request_received",
+                        from: userRes.rows[0]
+                    }));
+                }
+
+                ws.send(JSON.stringify({
+                    type: "friend_request_sent",
+                    to_user_id: toUserId
+                }));
+            }
+            if (data.type === "get_friend_requests") {
+                const result = await db.query(
+                    `
+                    SELECT 
+                        fr.id,
+                        u.id AS user_id,
+                        u.username,
+                        u.avatar_id,
+                        fr.created_at
+                    FROM friend_requests fr
+                    JOIN users u ON u.id = fr.from_user_id
+                    WHERE fr.to_user_id = $1
+                    AND fr.status = 'pending'
+                    ORDER BY fr.created_at DESC
+                    `,
+                    [ws.userId]
+                );
+
+                ws.send(JSON.stringify({
+                    type: "friend_requests_list",
+                    requests: result.rows
+                }));
+            }
+            if (data.type === "accept_friend_request") {
+                const requestId = Number(data.request_id);
+                if (!requestId) return;
+
+                const reqRes = await db.query(
+                    `
+                    SELECT from_user_id
+                    FROM friend_requests
+                    WHERE id=$1 AND to_user_id=$2 AND status='pending'
+                    `,
+                    [requestId, ws.userId]
+                );
+
+                if (reqRes.rows.length === 0) return;
+
+                const fromUserId = reqRes.rows[0].from_user_id;
+
+                // добавляем в друзья (в обе стороны)
+                await db.query(
+                    `
+                    INSERT INTO friends (user_id, friend_id)
+                    VALUES ($1, $2), ($2, $1)
+                    `,
+                    [ws.userId, fromUserId]
+                );
+
+                await db.query(
+                    `UPDATE friend_requests SET status='accepted' WHERE id=$1`,
+                    [requestId]
+                );
+
+                const userRes = await db.query(
+                    `SELECT id AS user_id, username, avatar_id FROM users WHERE id=$1`,
+                    [fromUserId]
+                );
+
+                ws.send(JSON.stringify({
+                    type: "friend_added",
+                    user: userRes.rows[0]
+                }));
+
+                // уведомляем второго пользователя
+                const targetWs = [...wss.clients].find(c => c.userId === fromUserId);
+                if (targetWs) {
+                    const meRes = await db.query(
+                        `SELECT id AS user_id, username, avatar_id FROM users WHERE id=$1`,
+                        [ws.userId]
+                    );
+
+                    targetWs.send(JSON.stringify({
+                        type: "friend_added",
+                        user: meRes.rows[0]
+                    }));
+                }
+            }
+            if (data.type === "get_friends") {
+                const result = await db.query(
+                    `
+                    SELECT 
+                        u.id AS user_id,
+                        u.username,
+                        u.avatar_id
+                    FROM friends f
+                    JOIN users u ON u.id = f.friend_id
+                    WHERE f.user_id = $1
+                    ORDER BY u.username
+                    `,
+                    [ws.userId]
+                );
+
+                const friends = result.rows.map(friend => {
+                    const isOnline = [...wss.clients].some(
+                        c => c.readyState === WebSocket.OPEN && c.userId === friend.user_id
+                    );
+
+                    return {
+                        user_id: friend.user_id,
+                        username: friend.username,
+                        avatar_id: friend.avatar_id,
+                        is_online: isOnline
+                    };
+                });
+
+                ws.send(JSON.stringify({
+                    type: "friends_list",
+                    friends
+                }));
+            }
+            if (data.type === "invite_to_game") {
+                const friendId = Number(data.friend_id);
+                if (!friendId) return;
+
+                if (!ws.roomId) {
+                    ws.send(JSON.stringify({
+                        type: "invite_failed",
+                        message: "Вы не в комнате"
+                    }));
+                    return;
+                }
+
+                // ищем WS приглашённого (ЕСЛИ ЕСТЬ — отправим)
+                const friendWs = [...wss.clients].find(
+                    c => c.readyState === WebSocket.OPEN && c.userId === friendId
+                );
+
+                if (friendWs) {
+                    friendWs.send(JSON.stringify({
+                        type: "game_invite",
+                        from: {
+                            user_id: ws.userId,
+                            username: ws.userData.username,
+                            avatar_id: ws.userData.avatar_id
+                        },
+                        room_id: ws.roomId
+                    }));
+                }
+
+                // всегда отвечаем приглашающему
+                ws.send(JSON.stringify({
+                    type: "invite_sent",
+                    to: friendId,
+                    room_id: ws.roomId
+                }));
+            }
+            if (data.type === "get_user_friends") {
+                const targetUserId = Number(data.user_id);
+                if (!targetUserId) return;
+
+                const result = await db.query(
+                    `
+                    SELECT 
+                        u.id AS user_id,
+                        u.username,
+                        u.avatar_id
+                    FROM friends f
+                    JOIN users u ON u.id = f.friend_id
+                    WHERE f.user_id = $1
+                    ORDER BY u.username
+                    `,
+                    [targetUserId]
+                );
+
+                const friends = result.rows.map(friend => {
+                    const isOnline = [...wss.clients].some(
+                        c => c.readyState === WebSocket.OPEN && c.userId === friend.user_id
+                    );
+
+                    return {
+                        user_id: friend.user_id,
+                        username: friend.username,
+                        avatar_id: friend.avatar_id,
+                        is_online: isOnline
+                    };
+                });
+
+                ws.send(JSON.stringify({
+                    type: "user_friends_list",
+                    user_id: targetUserId,
+                    friends
+                }));
+            }
+
 
         } catch (e) {
             console.error(e);
