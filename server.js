@@ -8,6 +8,8 @@ const games = {};
 const roomStartTimers = {}; // roomId -> timeout
 const DAY_DURATION = 20;   // секунды для дня
 const NIGHT_DURATION = 30; // секунды для ночи
+const PHASE_TICK_INTERVAL = 5000; // 5 секунд
+
 
 //#region Authorization
 function generateToken() {
@@ -260,14 +262,7 @@ async function leaveRoom(userId) {
         `DELETE FROM room_players WHERE room_id=$1 AND user_id=$2`,
         [roomId, userId]
     );
-    // 🩸 Если игра идёт — считаем игрока мёртвым
-        if (games[roomId]) {
-            const player = games[roomId].players.find(p => p.user_id === userId);
-            if (player) {
-                player.is_alive = false;
-            }
-            checkWinCondition(roomId);
-        }
+    
 
     // 3. Сколько игроков осталось
     const countRes = await db.query(
@@ -315,7 +310,10 @@ async function leaveRoom(userId) {
         }
     }
 
-    return roomId;
+    return {
+        roomId,
+        leavingPlayer
+    };
 }
 
 
@@ -357,6 +355,8 @@ function startDayVoting(roomId) {
         phase: "vote",
         duration: DAY_VOTE_DURATION
     });
+    startPhaseTimer(roomId, "vote", DAY_VOTE_DURATION);
+
 
     game.timer = setTimeout(
         () => endDayVoting(roomId),
@@ -378,6 +378,7 @@ async function startDay(roomId) {
         phase: "day",
         duration: DAY_DURATION
     });
+    startPhaseTimer(roomId, "day", DAY_DURATION);
 
     // считаем stats
     const totalMafia = game.players.filter(p => p.role === "mafia").length;
@@ -480,6 +481,8 @@ async function checkAutoStart(roomId) {
 }
 
 function endDayVoting(roomId) {
+    stopPhaseTimer(roomId);
+
     const game = games[roomId];
     if (!game) return;
 
@@ -618,6 +621,8 @@ async function startNight(roomId) {
         phase: "night",
         duration: NIGHT_DURATION
     });
+    startPhaseTimer(roomId, "night", NIGHT_DURATION);
+
 
     // Отправляем ночное действие только игрокам с активной ролью ночью
     const nightActors = game.players.filter(p =>
@@ -904,6 +909,51 @@ function handleNightAction(userId, targetId) {
     registerVote(player.roomId, voteType, userId, targetId, ws);
 }
 
+function startPhaseTimer(roomId, phase, durationSeconds) {
+    const game = games[roomId];
+    if (!game) return;
+
+    // очищаем старый тикер
+    if (game.phaseTicker) {
+        clearInterval(game.phaseTicker);
+        game.phaseTicker = null;
+    }
+
+    game.phaseEndsAt = Date.now() + durationSeconds * 1000;
+
+    // сразу отправляем первый тик
+    sendPhaseTick(roomId, phase);
+
+    game.phaseTicker = setInterval(() => {
+        sendPhaseTick(roomId, phase);
+    }, PHASE_TICK_INTERVAL);
+}
+
+function stopPhaseTimer(roomId) {
+    const game = games[roomId];
+    if (!game) return;
+
+    if (game.phaseTicker) {
+        clearInterval(game.phaseTicker);
+        game.phaseTicker = null;
+    }
+}
+
+function sendPhaseTick(roomId, phase) {
+    const game = games[roomId];
+    if (!game || !game.phaseEndsAt) return;
+
+    const secondsLeft = Math.max(
+        0,
+        Math.ceil((game.phaseEndsAt - Date.now()) / 1000)
+    );
+
+    broadcastToRoom(roomId, {
+        type: "phase_timer",
+        phase,
+        seconds_left: secondsLeft
+    });
+}
 
 // Функция назначения ролей
 // players — это массив объектов { user_id, username, avatar_id } из базы
@@ -967,6 +1017,8 @@ async function assignRoles(roomId, rolesArray, mafiaCount, players) {
 
 
 function endNight(roomId) {
+    stopPhaseTimer(roomId);
+
     const game = games[roomId];
     if (!game) return;
 
@@ -1262,6 +1314,8 @@ function checkWinCondition(roomId) {
     finishGame(roomId);
 }
 async function finishGame(roomId) {
+    stopPhaseTimer(roomId);
+
     const game = games[roomId];
     if (!game) return;
 
@@ -1281,6 +1335,111 @@ async function finishGame(roomId) {
 
     // ✅ Полностью удаляем игру из памяти
     delete games[roomId];
+}
+async function restoreGameState(ws) {
+    if (!ws.roomId) return;
+
+    const roomId = ws.roomId;
+    const game = games[roomId];
+
+    // ===============================
+    // 🏠 ЛОББИ (игра не началась)
+    // ===============================
+    if (!game) {
+        const playersRes = await db.query(
+            `
+            SELECT rp.user_id AS id, u.username, u.avatar_id
+            FROM room_players rp
+            JOIN users u ON u.id = rp.user_id
+            WHERE rp.room_id = $1
+            `,
+            [roomId]
+        );
+
+        ws.send(JSON.stringify({
+            type: "room_update",
+            players: playersRes.rows,
+            playerCount: playersRes.rows.length,
+            player_enter: null,
+            player_left: null
+        }));
+
+        return;
+    }
+
+    // ===============================
+    // 🎮 ИГРА ИДЁТ
+    // ===============================
+    const player = game.players.find(p => p.user_id === ws.userId);
+    if (!player) return;
+
+    // 1️⃣ Отправляем роль
+    const rolePayload = { type: "your_role", role: player.role };
+    if (player.role === "mafia") {
+        rolePayload.mafiaList = game.players
+            .filter(p => p.role === "mafia")
+            .map(p => p.user_id);
+    }
+    ws.send(JSON.stringify(rolePayload));
+
+    // 2️⃣ Текущая фаза
+    ws.send(JSON.stringify({
+        type: "phase_update",
+        phase: game.phase,
+        duration:
+            game.phase === "night" ? NIGHT_DURATION :
+            game.phase === "vote"  ? DAY_VOTE_DURATION :
+            DAY_DURATION
+    }));
+
+    // 3️⃣ Список живых игроков + статы
+    const totalMafia = game.players.filter(p => p.role === "mafia").length;
+    const totalPeaceful = game.players.length - totalMafia;
+    const aliveMafia = game.players.filter(p => p.role === "mafia" && p.is_alive).length;
+    const alivePeaceful = game.players.filter(p => p.role !== "mafia" && p.is_alive).length;
+
+    ws.send(JSON.stringify({
+        type: "day_players_list",
+        day: game.dayNumber,
+        players: game.players
+            .filter(p => p.is_alive)
+            .map(p => ({
+                user_id: p.user_id,
+                username: p.username,
+                avatar_id: p.avatar_id,
+                is_mafia: player.role === "mafia" && p.role === "mafia"
+            })),
+        stats: {
+            alive_peaceful: alivePeaceful,
+            dead_peaceful: totalPeaceful - alivePeaceful,
+            alive_mafia: aliveMafia,
+            dead_mafia: totalMafia - aliveMafia
+        }
+    }));
+
+    // 4️⃣ Если ночь — снова отправляем night_action_start
+    if (game.phase === "night") {
+        if (
+            ["mafia", "doctor", "sherif", "lover", "bodyguard", "sniper", "priest"]
+                .includes(player.role) &&
+            player.is_alive
+        ) {
+            ws.send(JSON.stringify({
+                type: "night_action_start",
+                role: player.role,
+                duration: NIGHT_DURATION,
+                players: game.players
+                    .filter(p => p.is_alive)
+                    .map(p => ({
+                        user_id: p.user_id,
+                        username: p.username,
+                        avatar_id: p.avatar_id,
+                        is_mafia: player.role === "mafia" && p.role === "mafia"
+                    }))
+            }));
+        }
+    }
+    sendPhaseTick(ws.roomId, game.phase);
 }
 
 
@@ -1347,16 +1506,20 @@ wss.on('connection', ws => {
                     ws.username = userData.username;
                     ws.userData = userData;    
 
-                    ws.send(JSON.stringify({ type: 'auth_success', userId, userData}));
-
-                    // 🔄 Восстанавливаем комнату при переподключении
+                    
+                    ws.send(JSON.stringify({ type: 'auth_success', userId, userData }));
+                    
                     const roomRes = await db.query(
                         'SELECT room_id FROM room_players WHERE user_id=$1',
                         [userId]
                     );
                     if (roomRes.rows.length > 0) {
                         ws.roomId = roomRes.rows[0].room_id;
+                        await restoreGameState(ws);
                     }
+
+
+
 
                     // Авто-продление токена сразу при auth
                     await refreshToken(data.token);
@@ -1892,22 +2055,47 @@ wss.on('connection', ws => {
     });
 
         ws.on('close', async () => {
-                console.log('Игрок отключился');
+    console.log('Игрок отключился');
 
-                if (!ws.userId) return;
+    if (!ws.userId) return;
 
-                const result = await leaveRoom(ws.userId);
+    // узнаём комнату игрока
+    const roomRes = await db.query(
+        'SELECT room_id FROM room_players WHERE user_id = $1',
+        [ws.userId]
+    );
 
-                if (result?.roomId) {
-                    await sendRoomUpdate(
-                        result.roomId,
-                        null,
-                        result.leavingPlayer
-                    );
-                    checkAutoStart(result.roomId);
-                }
+    if (roomRes.rows.length === 0) return;
 
-            });
+    const roomId = roomRes.rows[0].room_id;
+    const game = games[roomId];
+
+    // ===============================
+    // 🎮 ИГРА УЖЕ НАЧАЛАСЬ → AFK
+    // ===============================
+    if (game) {
+        // НИЧЕГО НЕ ДЕЛАЕМ
+        // игрок остаётся в игре, просто без WS
+        return;
+    }
+
+    // ===============================
+    // 🏠 ИГРА НЕ НАЧАЛАСЬ → ВЫХОД
+    // ===============================
+    const result = await leaveRoom(ws.userId);
+
+    if (result?.roomId) {
+        await sendRoomUpdate(
+            result.roomId,
+            null,
+            result.leavingPlayer
+        );
+        checkAutoStart(result.roomId);
+    }
+});
+
+
+
 
 });
 
