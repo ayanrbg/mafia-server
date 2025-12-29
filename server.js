@@ -1496,39 +1496,72 @@ wss.on('connection', ws => {
             // Авторизация
             if (data.type === 'auth') {
                 const userId = await verifyToken(data.token);
-                if (userId) {
-                    ws.userId = userId;
-                    ws.token = data.token;
-                    
-
-                    const userData = await getUserData(userId);
-
-                    ws.username = userData.username;
-                    ws.userData = userData;    
-
-                    
-                    ws.send(JSON.stringify({ type: 'auth_success', userId, userData }));
-                    
-                    const roomRes = await db.query(
-                        'SELECT room_id FROM room_players WHERE user_id=$1',
-                        [userId]
-                    );
-                    if (roomRes.rows.length > 0) {
-                        ws.roomId = roomRes.rows[0].room_id;
-                        await restoreGameState(ws);
-                    }
-
-
-
-
-                    // Авто-продление токена сразу при auth
-                    await refreshToken(data.token);
-                    console.log('Игрок авторизован и токен продлён:', userId);
-                } else {
+                if (!userId) {
                     ws.send(JSON.stringify({ type: 'auth_failed' }));
                     ws.close();
-                }   
+                    return;
+                }
+
+                ws.userId = userId;
+                ws.token = data.token;
+
+                const userData = await getUserData(userId);
+                ws.username = userData.username;
+                ws.userData = userData;
+
+                // 1️⃣ базовая авторизация
+                ws.send(JSON.stringify({
+                    type: 'auth_success',
+                    userId,
+                    userData
+                }));
+
+                // 2️⃣ если игрок состоит в комнате — отправляем ИНФУ О КОМНАТЕ
+                const roomInfoRes = await db.query(
+                    `
+                    SELECT 
+                        r.id,
+                        r.name,
+                        r.level,
+                        r.min_players,
+                        r.max_players,
+                        r.mafia_count,
+                        r.roles
+                    FROM room_players rp
+                    JOIN rooms r ON r.id = rp.room_id
+                    WHERE rp.user_id = $1
+                    LIMIT 1
+                    `,
+                    [userId]
+                );
+
+                if (roomInfoRes.rows.length > 0) {
+                    const room = roomInfoRes.rows[0];
+
+                    ws.roomId = room.id;
+
+                    ws.send(JSON.stringify({
+                        type: "room_info",
+                        room: {
+                            id: room.id,
+                            name: room.name,
+                            level: room.level,
+                            min_players: room.min_players,
+                            max_players: room.max_players,
+                            mafia_count: room.mafia_count,
+                            roles: room.roles
+                        }
+                    }));
+
+                    // 3️⃣ восстановление состояния (лобби или игра)
+                    await restoreGameState(ws);
+                }
+
+                // 4️⃣ продление токена
+                await refreshToken(data.token);
+                console.log('Игрок авторизован и токен продлён:', userId);
             }
+
             // Получение списка комнат
             if (data.type === 'get_rooms') {
                 try {
@@ -2043,6 +2076,67 @@ wss.on('connection', ws => {
                     friends
                 }));
             }
+            if (data.type === "get_rating") {
+                const limit = Math.min(Number(data.limit) || 50, 100);
+                const userId = ws.userId;
+
+                // 1️⃣ ТОП РЕЙТИНГА
+                const topRes = await db.query(
+                    `
+                    SELECT
+                        place,
+                        user_id,
+                        username,
+                        avatar_id,
+                        experience
+                    FROM (
+                        SELECT
+                            ROW_NUMBER() OVER (ORDER BY experience DESC, id ASC) AS place,
+                            id AS user_id,
+                            username,
+                            avatar_id,
+                            experience
+                        FROM users
+                    ) ranked
+                    ORDER BY place
+                    LIMIT $1
+                    `,
+                    [limit]
+                );
+
+
+                // 2️⃣ МОЁ МЕСТО В РЕЙТИНГЕ
+                const meRes = await db.query(
+                    `           
+                    SELECT
+                        place,
+                        user_id,
+                        username,
+                        avatar_id,
+                        experience
+                    FROM (
+                        SELECT
+                            ROW_NUMBER() OVER (ORDER BY experience DESC, id ASC) AS place,
+                            id AS user_id,
+                            username,
+                            avatar_id,
+                            experience
+                        FROM users
+                    ) ranked
+                    WHERE user_id = $1
+                    LIMIT 1
+                    `,
+                    [userId]
+                );
+
+
+                ws.send(JSON.stringify({
+                    type: "rating_result",
+                    top: topRes.rows,
+                    me: meRes.rows[0] || null
+                }));
+            }
+
 
 
         } catch (e) {
