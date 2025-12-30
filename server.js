@@ -1516,46 +1516,75 @@ wss.on('connection', ws => {
                     userData
                 }));
 
-                // 2️⃣ если игрок состоит в комнате — отправляем ИНФУ О КОМНАТЕ
-                const roomInfoRes = await db.query(
+                // 2️⃣ если игрок состоит в комнате — отправляем ПОЛНУЮ ИНФУ О КОМНАТЕ
+                    const roomInfoRes = await db.query(
                     `
-                    SELECT 
+                    SELECT
                         r.id,
                         r.name,
-                        r.level,
+                        r.password,
                         r.min_players,
                         r.max_players,
+                        r.level,
+                        r.roles,
+                        r.created_by,
+                        r.created_at,
+                        r.phase,
+                        r.game_started,
                         r.mafia_count,
-                        r.roles
+                        COUNT(rp.user_id)::int AS alive_count
                     FROM room_players rp
                     JOIN rooms r ON r.id = rp.room_id
                     WHERE rp.user_id = $1
+                    GROUP BY r.id
                     LIMIT 1
                     `,
                     [userId]
-                );
+                    );
 
-                if (roomInfoRes.rows.length > 0) {
-                    const room = roomInfoRes.rows[0];
+                    if (roomInfoRes.rows.length > 0) {
+                        const room = roomInfoRes.rows[0];
 
-                    ws.roomId = room.id;
+                        ws.roomId = room.id;
 
-                    ws.send(JSON.stringify({
-                        type: "room_info",
-                        room: {
-                            id: room.id,
-                            name: room.name,
-                            level: room.level,
-                            min_players: room.min_players,
-                            max_players: room.max_players,
-                            mafia_count: room.mafia_count,
-                            roles: room.roles
-                        }
-                    }));
+                        // получаем игроков комнаты
+                        const playersRes = await db.query(
+                            `
+                            SELECT
+                                u.id,
+                                u.username,
+                                u.avatar_id
+                            FROM room_players rp
+                            JOIN users u ON u.id = rp.user_id
+                            WHERE rp.room_id = $1
+                            `,
+                            [room.id]
+                        );
 
-                    // 3️⃣ восстановление состояния (лобби или игра)
-                    await restoreGameState(ws);
-                }
+                        ws.send(JSON.stringify({
+                            type: "room_info",
+                            room: {
+                                id: room.id,
+                                name: room.name,
+                                password: null, // ❗ никогда не отправляем хеш
+                                min_players: room.min_players,
+                                max_players: room.max_players,
+                                level: room.level,
+                                roles: room.roles,
+                                created_by: room.created_by,
+                                created_at: room.created_at,
+                                phase: room.phase,
+                                game_started: room.game_started,
+                                mafia_count: room.mafia_count,
+                                alive_count: room.alive_count,
+                                players: playersRes.rows
+                            }
+                        }));
+
+                        // 3️⃣ восстановление состояния (лобби или игра)
+                        await restoreGameState(ws);
+                    }
+
 
                 // 4️⃣ продление токена
                 await refreshToken(data.token);
