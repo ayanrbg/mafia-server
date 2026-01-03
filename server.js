@@ -319,22 +319,35 @@ async function leaveRoom(userId) {
 
 
 async function sendRoomUpdate(roomId, enteringPlayer = null, leavingPlayer = null) {
+    // 1️⃣ игроки
     const playersRes = await db.query(
-        `SELECT rp.user_id as id, u.username, u.avatar_id
-         FROM room_players rp
-         JOIN users u ON u.id = rp.user_id
-         WHERE rp.room_id = $1`,
+        `
+        SELECT rp.user_id as id, u.username, u.avatar_id
+        FROM room_players rp
+        JOIN users u ON u.id = rp.user_id
+        WHERE rp.room_id = $1
+        `,
         [roomId]
     );
+
+    // 2️⃣ параметры комнаты
+    const roomRes = await db.query(
+        `SELECT max_players FROM rooms WHERE id = $1`,
+        [roomId]
+    );
+
+    const maxPlayerCount = roomRes.rows[0]?.max_players ?? 0;
 
     broadcastToRoom(roomId, {
         type: "room_update",
         players: playersRes.rows,
         playerCount: playersRes.rows.length,
+        maxPlayerCount,               // ✅ ДОБАВИЛИ
         player_enter: enteringPlayer,
-        player_left: leavingPlayer // будет null или объект игрока
+        player_left: leavingPlayer
     });
 }
+
 
 //#endregion
 
@@ -427,9 +440,8 @@ async function startDay(roomId) {
 async function checkAutoStart(roomId) {
     const roomRes = await db.query(`SELECT * FROM rooms WHERE id=$1`, [roomId]);
     if (roomRes.rows.length === 0) return;
-    const room = roomRes.rows[0];
 
-    // Игра уже началась — не нужно автозапускать
+    const room = roomRes.rows[0];
     if (room.game_started) return;
 
     const playersRes = await db.query(
@@ -438,10 +450,11 @@ async function checkAutoStart(roomId) {
     );
     const count = Number(playersRes.rows[0].count);
 
-    // Если игроков меньше минимума — отменяем таймер
+    // ❌ меньше минимума — отмена
     if (count < room.min_players) {
         if (roomStartTimers[roomId]) {
-            clearTimeout(roomStartTimers[roomId]);
+            clearInterval(roomStartTimers[roomId].interval);
+            clearTimeout(roomStartTimers[roomId].timeout);
             delete roomStartTimers[roomId];
 
             broadcastToRoom(roomId, {
@@ -451,34 +464,51 @@ async function checkAutoStart(roomId) {
         return;
     }
 
-    // Если игроков достаточно и таймера нет — запускаем обратный отсчёт
-    if (!roomStartTimers[roomId]) {
-        broadcastToRoom(roomId, {
-            type: "auto_start_timer",
-            seconds: 15
-        });
+    // ✅ уже запущен — ничего не делаем
+    if (roomStartTimers[roomId]) return;
 
-        roomStartTimers[roomId] = setTimeout(async () => {
-            delete roomStartTimers[roomId];
+    let secondsLeft = 15;
 
-            // На всякий случай — проверим снова количество игроков
-            const playersRes2 = await db.query(
-                `SELECT COUNT(*) FROM room_players WHERE room_id=$1`,
-                [roomId]
-            );
-            const count2 = Number(playersRes2.rows[0].count);
+    // ⏱ стартовое сообщение
+    broadcastToRoom(roomId, {
+        type: "auto_start_timer",
+        seconds: secondsLeft
+    });
 
-            if (count2 >= room.min_players) {
-                await tryStartGame(room.created_by);
-            } else {
-                broadcastToRoom(roomId, {
-                    type: "auto_start_cancelled"
-                });
-            }
+    // 🔁 каждые 3 секунды
+    const interval = setInterval(() => {
+        secondsLeft -= 3;
+        if (secondsLeft > 0) {
+            broadcastToRoom(roomId, {
+                type: "auto_start_timer",
+                seconds: secondsLeft
+            });
+        }
+    }, 3000);
 
-        }, 15000);
-    }
+    // 🚀 финальный запуск
+    const timeout = setTimeout(async () => {
+        clearInterval(interval);
+        delete roomStartTimers[roomId];
+
+        const checkRes = await db.query(
+            `SELECT COUNT(*) FROM room_players WHERE room_id=$1`,
+            [roomId]
+        );
+        const finalCount = Number(checkRes.rows[0].count);
+
+        if (finalCount >= room.min_players) {
+            await tryStartGame(room.created_by);
+        } else {
+            broadcastToRoom(roomId, {
+                type: "auto_start_cancelled"
+            });
+        }
+    }, 15000);
+
+    roomStartTimers[roomId] = { interval, timeout };
 }
+
 
 function endDayVoting(roomId) {
     stopPhaseTimer(roomId);
@@ -1508,6 +1538,7 @@ wss.on('connection', ws => {
                 const userData = await getUserData(userId);
                 ws.username = userData.username;
                 ws.userData = userData;
+                ws.avatar_id = userData.avatar_id;
 
                 // 1️⃣ базовая авторизация
                 ws.send(JSON.stringify({
@@ -1782,7 +1813,7 @@ wss.on('connection', ws => {
                         type: "chat_message",
                         user_id: ws.userId,
                         username: ws.username || "Player",
-                        avatar_id: ws.avatar_id || 1,
+                        avatar_id: ws.avatar_id,
                         text: data.text,
                         time: now.toTimeString().slice(0,5),
                     };
