@@ -629,17 +629,20 @@ for (const [fromUserId, targetUserId] of Object.entries(game.votes.day)) {
 
     // очищаем дневные голоса
     game.votes.day = {};
-
+    resetVotes(roomId);
+    
     checkWinCondition(roomId);
     // через небольшую задержку запускаем ночь
     game.timer = setTimeout(() => startNight(roomId), DAY_RESULTS_DURATION * 1000);
 }
 
 async function startNight(roomId) {
-    resetVotes(roomId);
+    
     const game = games[roomId];
     if (!game) return;
 
+    resetVotes(roomId);
+    
     game.phase = "night";
 
     // Обновляем фазу в БД
@@ -778,10 +781,10 @@ function validateVote(game, voter, targetId, voteType) {
         return "Сейчас не ночь";
     }
 
-    // 4. Нельзя менять голос
-    if (game.votes[voteType]?.[voter.user_id]) {
-        return "Вы уже проголосовали";
-    }
+    // // 4. Нельзя менять голос
+    // if (game.votes[voteType]?.[voter.user_id]) {
+    //     return "Вы уже проголосовали";
+    // }
 
     // ===============================
     // 🔥 ИСКЛЮЧЕНИЯ ПО РОЛЯМ
@@ -1608,6 +1611,7 @@ wss.on('connection', ws => {
                                 game_started: room.game_started,
                                 mafia_count: room.mafia_count,
                                 alive_count: room.alive_count,
+                                playerCount: playersRes.rows.length,
                                 players: playersRes.rows
                             }
                         }));
