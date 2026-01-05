@@ -49,22 +49,38 @@ async function refreshToken(token) {
 
 // Регистрация нового игрока
 async function registerUser(username, password) {
-    const exists = await db.query('SELECT * FROM users WHERE username=$1', [username]);
-    if (exists.rows.length > 0) return null; // ник занят
+    if (!username || !password) return null;
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10);
 
-    const result = await db.query(
-        'INSERT INTO users(username, password, avatar_id, balance, experience) VALUES($1, $2, $3, $4, $5) RETURNING *',
-        [username, hashedPassword, 1, 100, 0]
-    );
+        const result = await db.query(
+            `
+            INSERT INTO users (username, password, avatar_id, balance, experience)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *
+            `,
+            [username, hashedPassword, 1, 100, 0]
+        );
 
-    const token = generateToken();
-    const expires = new Date(Date.now() + 15 * 60 * 1000); // +15 минут
-    await db.query('INSERT INTO tokens(user_id, token, expires_at) VALUES($1, $2, $3)', [result.rows[0].id, token, expires]);
+        const token = generateToken();
+        const expires = new Date(Date.now() + 15 * 60 * 1000);
 
-    return { user: result.rows[0], token };
+        await db.query(
+            'INSERT INTO tokens(user_id, token, expires_at) VALUES($1, $2, $3)',
+            [result.rows[0].id, token, expires]
+        );
+
+        return { user: result.rows[0], token };
+
+    } catch (err) {
+        if (err.code === '23505') {
+            return { error: 'USERNAME_TAKEN' };
+        }
+        throw err;
+    }
 }
+
 
 async function loginUser(username, password) {
     if (!username || !password) return null; // защита от пустых данных
@@ -1509,9 +1525,28 @@ wss.on('connection', ws => {
             // Регистрация
             if (data.type === 'register') {
                 const res = await registerUser(data.username, data.password);
-                if (res) ws.send(JSON.stringify({ type: 'register_success', token: res.token, userId: res.user.id }));
-                else ws.send(JSON.stringify({ type: 'register_failed', message: 'Ник занят' }));
+
+                if (res?.error === 'USERNAME_TAKEN') {
+                    ws.send(JSON.stringify({
+                        type: 'register_failed',
+                        message: 'Логин уже занят'
+                    }));
+                }
+                else if (res) {
+                    ws.send(JSON.stringify({
+                        type: 'register_success',
+                        token: res.token,
+                        userId: res.user.id
+                    }));
+                }
+                else {
+                    ws.send(JSON.stringify({
+                        type: 'register_failed',
+                        message: 'Ошибка регистрации'
+                    }));
+                }
             }
+
             // Логин
             if (data.type === 'login') {
                 try {
