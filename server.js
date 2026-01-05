@@ -1888,7 +1888,7 @@ wss.on('connection', ws => {
                     FROM users
                     WHERE LOWER(username) LIKE LOWER($1)
                     AND id != $2
-                    LIMIT 20
+                    LIMIT 10
                     `,
                     [`%${query}%`, ws.userId]
                 );
