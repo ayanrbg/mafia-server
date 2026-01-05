@@ -1665,18 +1665,50 @@ wss.on('connection', ws => {
             if (data.type === 'get_rooms') {
                 try {
                     const roomsRes = await db.query(
-                        `SELECT r.id, r.name, r.level, r.min_players, r.max_players, r.roles, COUNT(rp.user_id)::int as current_players
+                        `
+                        SELECT
+                            r.id,
+                            r.name,
+                            r.level,
+                            r.min_players,
+                            r.max_players,
+                            r.roles,
+                            r.game_started,
+                            (r.password IS NOT NULL) AS has_password,
+                            COUNT(rp.user_id)::int AS current_players
                         FROM rooms r
                         LEFT JOIN room_players rp ON r.id = rp.room_id
-                        GROUP BY r.id`
+                        GROUP BY r.id
+                        ORDER BY r.id DESC
+                        `
                     );
 
-                    ws.send(JSON.stringify({ type: 'get_rooms_success', rooms: roomsRes.rows }));
+                    const rooms = roomsRes.rows.map(r => ({
+                        id: r.id,
+                        name: r.name,
+                        level: r.level,
+                        min_players: r.min_players,
+                        max_players: r.max_players,
+                        roles: r.roles,
+                        current_players: r.current_players,
+
+                        hasPassword: r.has_password,
+                        game_started: r.game_started
+                    }));
+
+                    ws.send(JSON.stringify({
+                        type: 'get_rooms_success',
+                        rooms
+                    }));
                 } catch (e) {
                     console.error(e);
-                    ws.send(JSON.stringify({ type: 'get_rooms_failed', message: 'Ошибка сервера' }));
+                    ws.send(JSON.stringify({
+                        type: 'get_rooms_failed',
+                        message: 'Ошибка сервера'
+                    }));
                 }
             }
+
             if (data.type === 'create_room') {
                 try {
                     const {
