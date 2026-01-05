@@ -1951,18 +1951,33 @@ wss.on('connection', ws => {
 
                 const result = await db.query(
                     `
-                    SELECT id AS user_id, username, avatar_id
-                    FROM users
-                    WHERE LOWER(username) LIKE LOWER($1)
-                    AND id != $2
+                    SELECT
+                        u.id AS user_id,
+                        u.username,
+                        u.avatar_id,
+                        EXISTS (
+                            SELECT 1
+                            FROM friends f
+                            WHERE f.user_id = $2 AND f.friend_id = u.id
+                        ) AS is_friend
+                    FROM users u
+                    WHERE LOWER(u.username) LIKE LOWER($1)
+                    AND u.id != $2
+                    ORDER BY u.username
                     LIMIT 10
                     `,
                     [`%${query}%`, ws.userId]
                 );
 
+
                 ws.send(JSON.stringify({
                     type: "search_users_result",
-                    users: result.rows
+                    users: result.rows.map(u => ({
+                        user_id: u.user_id,
+                        username: u.username,
+                        avatar_id: u.avatar_id,
+                        isFriend: u.is_friend     // ✅ ВОТ ЗДЕСЬ
+                    }))
                 }));
             }
             if (data.type === "send_friend_request") {
