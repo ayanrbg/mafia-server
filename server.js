@@ -62,6 +62,11 @@ async function registerUser(username, password) {
             `,
             [username, hashedPassword, 1, 100, 0]
         );
+        await db.query(
+            `INSERT INTO user_stats (user_id) VALUES ($1)`,
+            [result.rows[0].id]
+        );
+
 
         const token = generateToken();
         const expires = new Date(Date.now() + 15 * 60 * 1000);
@@ -1383,6 +1388,35 @@ async function finishGame(roomId) {
     );
 
     // ✅ Полностью удаляем игру из памяти
+
+    for (const p of game.players) {
+    const isMafia = p.role === "mafia";
+    const isWinner =
+        (winner === "mafia" && isMafia) ||
+        (winner === "peaceful" && !isMafia);
+
+    await db.query(
+        `
+        UPDATE user_stats
+        SET
+            games_played = games_played + 1,
+            mafia_games = mafia_games + $2,
+            mafia_wins = mafia_wins + $3,
+            peaceful_games = peaceful_games + $4,
+            peaceful_wins = peaceful_wins + $5
+        WHERE user_id = $1
+        `,
+        [
+            p.user_id,
+            isMafia ? 1 : 0,
+            isMafia && isWinner ? 1 : 0,
+            !isMafia ? 1 : 0,
+            !isMafia && isWinner ? 1 : 0
+        ]
+    );
+}
+
+
     delete games[roomId];
 }
 async function restoreGameState(ws) {
@@ -1415,6 +1449,7 @@ async function restoreGameState(ws) {
 
         return;
     }
+
 
     // ===============================
     // 🎮 ИГРА ИДЁТ
@@ -1491,7 +1526,42 @@ async function restoreGameState(ws) {
     sendPhaseTick(ws.roomId, game.phase);
 }
 
+async function sendFriendsList(ws, userId) {
+    const result = await db.query(
+        `
+        SELECT 
+            u.id AS user_id,
+            u.username,
+            u.avatar_id,
+            u.level
+        FROM friends f
+        JOIN users u ON u.id = f.friend_id
+        WHERE f.user_id = $1
+        ORDER BY u.username
+        `,
+        [userId]
+    );
 
+    const friends = result.rows.map(friend => {
+        const isOnline = [...wss.clients].some(
+            c => c.readyState === WebSocket.OPEN && c.userId === friend.user_id
+        );
+
+        return {
+            user_id: friend.user_id,
+            username: friend.username,
+            avatar_id: friend.avatar_id,
+            level: friend.level,
+            is_online: isOnline,
+            isFriend: true
+        };
+    });
+
+    ws.send(JSON.stringify({
+        type: "friends_list",
+        friends
+    }));
+}
 //#endregion
 
 
@@ -1996,48 +2066,115 @@ wss.on('connection', ws => {
                     }));
                 }
 
-                // уже есть заявка?
-                const exists = await db.query(
+                // есть ли заявка (любая)
+                const existing = await db.query(
                     `
-                    SELECT 1 FROM friend_requests
-                    WHERE from_user_id=$1 AND to_user_id=$2 AND status='pending'
+                    SELECT id, status
+                    FROM friend_requests
+                    WHERE from_user_id=$1 AND to_user_id=$2
+                    ORDER BY created_at DESC
+                    LIMIT 1
                     `,
                     [ws.userId, toUserId]
                 );
-                if (exists.rows.length > 0) {
-                    return ws.send(JSON.stringify({
-                        type: "friend_request_failed",
-                        message: "Заявка уже отправлена"
-                    }));
-                }
 
-                await db.query(
-                    `
-                    INSERT INTO friend_requests (from_user_id, to_user_id)
-                    VALUES ($1, $2)
-                    `,
-                    [ws.userId, toUserId]
-                );
+                if (existing.rows.length > 0) {
+                    const { status, id } = existing.rows[0];
+
+                    // ⛔ ещё не ответили
+                    if (status === "pending") {
+                        return ws.send(JSON.stringify({
+                            type: "friend_request_failed",
+                            message: "Заявка уже отправлена"
+                        }));
+                    }
+
+                    // ♻️ была отклонена → обновляем
+                    if (status === "declined") {
+                        await db.query(
+                            `
+                            UPDATE friend_requests
+                            SET status='pending', created_at=NOW()
+                            WHERE id=$1
+                            `,
+                            [id]
+                        );
+                    }
+                }
+                else {
+                    // 🆕 заявки не было — создаём
+                    await db.query(
+                        `
+                        INSERT INTO friend_requests (from_user_id, to_user_id)
+                        VALUES ($1, $2)
+                        `,
+                        [ws.userId, toUserId]
+                    );
+                }
 
                 // уведомляем получателя если онлайн
                 const targetWs = [...wss.clients].find(c => c.userId === toUserId);
                 if (targetWs) {
-                    const userRes = await db.query(
-                        `SELECT id AS user_id, username, avatar_id FROM users WHERE id=$1`,
-                        [ws.userId]
+                    const requestsRes = await db.query(
+                        `
+                        SELECT 
+                            fr.id,
+                            u.id AS user_id,
+                            u.username,
+                            u.avatar_id,
+                            fr.created_at
+                        FROM friend_requests fr
+                        JOIN users u ON u.id = fr.from_user_id
+                        WHERE fr.to_user_id = $1
+                        AND fr.status = 'pending'
+                        ORDER BY fr.created_at DESC
+                        `,
+                        [toUserId]
                     );
 
                     targetWs.send(JSON.stringify({
-                        type: "friend_request_received",
-                        from: userRes.rows[0]
+                        type: "friend_requests_list",
+                        requests: requestsRes.rows
                     }));
                 }
+
 
                 ws.send(JSON.stringify({
                     type: "friend_request_sent",
                     to_user_id: toUserId
                 }));
             }
+            if (data.type === "get_user_stats") {
+                const targetUserId = Number(data.user_id);
+                if (!targetUserId) return;
+
+                const result = await db.query(
+                    `
+                    SELECT
+                        games_played,
+                        mafia_games,
+                        mafia_wins,
+                        peaceful_games,
+                        peaceful_wins
+                    FROM user_stats
+                    WHERE user_id = $1
+                    `,
+                    [targetUserId]
+                );
+
+                ws.send(JSON.stringify({
+                    type: "user_stats",
+                    user_id: targetUserId,
+                    stats: result.rows[0] || {
+                        games_played: 0,
+                        mafia_games: 0,
+                        mafia_wins: 0,
+                        peaceful_games: 0,
+                        peaceful_wins: 0
+                    }
+                }));
+            }
+                
             if (data.type === "get_friend_requests") {
                 const result = await db.query(
                     `
@@ -2061,15 +2198,19 @@ wss.on('connection', ws => {
                     requests: result.rows
                 }));
             }
-            if (data.type === "accept_friend_request") {
+            if (data.type === "respond_friend_request") {
                 const requestId = Number(data.request_id);
-                if (!requestId) return;
+                const action = data.action; // "accept" | "decline"
+
+                if (!requestId || !["accept", "decline"].includes(action)) return;
 
                 const reqRes = await db.query(
                     `
                     SELECT from_user_id
                     FROM friend_requests
-                    WHERE id=$1 AND to_user_id=$2 AND status='pending'
+                    WHERE id = $1
+                    AND to_user_id = $2
+                    AND status = 'pending'
                     `,
                     [requestId, ws.userId]
                 );
@@ -2078,51 +2219,47 @@ wss.on('connection', ws => {
 
                 const fromUserId = reqRes.rows[0].from_user_id;
 
-                // добавляем в друзья (в обе стороны)
-                await db.query(
-                    `
-                    INSERT INTO friends (user_id, friend_id)
-                    VALUES ($1, $2), ($2, $1)
-                    `,
-                    [ws.userId, fromUserId]
-                );
-
-                await db.query(
-                    `UPDATE friend_requests SET status='accepted' WHERE id=$1`,
-                    [requestId]
-                );
-
-                const userRes = await db.query(
-                    `SELECT id AS user_id, username, avatar_id FROM users WHERE id=$1`,
-                    [fromUserId]
-                );
-
-                ws.send(JSON.stringify({
-                    type: "friend_added",
-                    user: userRes.rows[0]
-                }));
-
-                // уведомляем второго пользователя
-                const targetWs = [...wss.clients].find(c => c.userId === fromUserId);
-                if (targetWs) {
-                    const meRes = await db.query(
-                        `SELECT id AS user_id, username, avatar_id FROM users WHERE id=$1`,
-                        [ws.userId]
+                if (action === "accept") {
+                    await db.query(
+                        `
+                        INSERT INTO friends (user_id, friend_id)
+                        VALUES ($1, $2), ($2, $1)
+                        `,
+                        [ws.userId, fromUserId]
                     );
 
-                    targetWs.send(JSON.stringify({
-                        type: "friend_added",
-                        user: meRes.rows[0]
-                    }));
+                    await db.query(
+                        `UPDATE friend_requests SET status = 'accepted' WHERE id = $1`,
+                        [requestId]
+                    );
+                }
+
+                if (action === "decline") {
+                    await db.query(
+                        `UPDATE friend_requests SET status = 'declined' WHERE id = $1`,
+                        [requestId]
+                    );
+                }
+
+                // 🔄 ОБНОВЛЯЕМ СПИСОК ДРУЗЕЙ У ТЕКУЩЕГО ИГРОКА
+                await sendFriendsList(ws, ws.userId);
+
+                // 🔄 И У ВТОРОГО ИГРОКА (ЕСЛИ ОН ОНЛАЙН)
+                const targetWs = [...wss.clients].find(c => c.userId === fromUserId);
+                if (targetWs) {
+                    await sendFriendsList(targetWs, fromUserId);
                 }
             }
+
+
             if (data.type === "get_friends") {
                 const result = await db.query(
                     `
                     SELECT 
                         u.id AS user_id,
                         u.username,
-                        u.avatar_id
+                        u.avatar_id,
+                        u.level
                     FROM friends f
                     JOIN users u ON u.id = f.friend_id
                     WHERE f.user_id = $1
@@ -2140,7 +2277,9 @@ wss.on('connection', ws => {
                         user_id: friend.user_id,
                         username: friend.username,
                         avatar_id: friend.avatar_id,
-                        is_online: isOnline
+                        level: friend.level,      // ✅ ДОБАВЛЕНО
+                        is_online: isOnline,
+                        isFriend: true
                     };
                 });
 
@@ -2149,6 +2288,7 @@ wss.on('connection', ws => {
                     friends
                 }));
             }
+
             if (data.type === "invite_to_game") {
                 const friendId = Number(data.friend_id);
                 if (!friendId) return;
