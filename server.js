@@ -2025,6 +2025,7 @@ wss.on('connection', ws => {
                         u.id AS user_id,
                         u.username,
                         u.avatar_id,
+                        u.level,
                         EXISTS (
                             SELECT 1
                             FROM friends f
@@ -2052,6 +2053,7 @@ wss.on('connection', ws => {
                             username: u.username,
                             avatar_id: u.avatar_id,
                             isFriend: u.is_friend,
+                            level: u.level,
                             is_online: isOnline
                         };
                     })
