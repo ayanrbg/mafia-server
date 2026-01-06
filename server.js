@@ -2132,6 +2132,7 @@ wss.on('connection', ws => {
                             u.id AS user_id,
                             u.username,
                             u.avatar_id,
+                            u.level,
                             fr.created_at
                         FROM friend_requests fr
                         JOIN users u ON u.id = fr.from_user_id
@@ -2193,6 +2194,7 @@ wss.on('connection', ws => {
                         u.id AS user_id,
                         u.username,
                         u.avatar_id,
+                        u.level,
                         fr.created_at
                     FROM friend_requests fr
                     JOIN users u ON u.id = fr.from_user_id
