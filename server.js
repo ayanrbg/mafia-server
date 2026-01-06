@@ -2042,13 +2042,21 @@ wss.on('connection', ws => {
 
                 ws.send(JSON.stringify({
                     type: "search_users_result",
-                    users: result.rows.map(u => ({
-                        user_id: u.user_id,
-                        username: u.username,
-                        avatar_id: u.avatar_id,
-                        isFriend: u.is_friend     // ✅ ВОТ ЗДЕСЬ
-                    }))
+                    users: result.rows.map(u => {
+                        const isOnline = [...wss.clients].some(
+                            c => c.readyState === WebSocket.OPEN && c.userId === u.user_id
+                        );
+
+                        return {
+                            user_id: u.user_id,
+                            username: u.username,
+                            avatar_id: u.avatar_id,
+                            isFriend: u.is_friend,
+                            is_online: isOnline
+                        };
+                    })
                 }));
+
             }
             if (data.type === "send_friend_request") {
                 const toUserId = Number(data.to_user_id);
