@@ -2231,6 +2231,7 @@ wss.on('connection', ws => {
 
                 const fromUserId = reqRes.rows[0].from_user_id;
 
+                // === ОБРАБОТКА РЕШЕНИЯ ===
                 if (action === "accept") {
                     await db.query(
                         `
@@ -2253,15 +2254,46 @@ wss.on('connection', ws => {
                     );
                 }
 
-                // 🔄 ОБНОВЛЯЕМ СПИСОК ДРУЗЕЙ У ТЕКУЩЕГО ИГРОКА
+                // 🔄 1️⃣ ОБНОВЛЯЕМ СПИСОК ДРУЗЕЙ
                 await sendFriendsList(ws, ws.userId);
 
-                // 🔄 И У ВТОРОГО ИГРОКА (ЕСЛИ ОН ОНЛАЙН)
                 const targetWs = [...wss.clients].find(c => c.userId === fromUserId);
                 if (targetWs) {
                     await sendFriendsList(targetWs, fromUserId);
                 }
+
+                // 🔄 2️⃣ ОБНОВЛЯЕМ СПИСОК ЗАЯВОК (ВАЖНО!)
+                const requestsRes = await db.query(
+                    `
+                    SELECT 
+                        fr.id,
+                        u.id AS user_id,
+                        u.username,
+                        u.avatar_id,
+                        u.level,
+                        fr.created_at
+                    FROM friend_requests fr
+                    JOIN users u ON u.id = fr.from_user_id
+                    WHERE fr.to_user_id = $1
+                    AND fr.status = 'pending'
+                    ORDER BY fr.created_at DESC
+                    `,
+                    [ws.userId]
+                );
+
+                ws.send(JSON.stringify({
+                    type: "friend_requests_list",
+                    requests: requestsRes.rows.map(r => ({
+                        request_id: r.id,
+                        user_id: r.user_id,
+                        username: r.username,
+                        avatar_id: r.avatar_id,
+                        level: r.level,
+                        created_at: r.created_at
+                    }))
+                }));
             }
+
 
 
             if (data.type === "get_friends") {
