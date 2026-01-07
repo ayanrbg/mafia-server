@@ -2345,7 +2345,31 @@ wss.on('connection', ws => {
                     return;
                 }
 
-                // ищем WS приглашённого (ЕСЛИ ЕСТЬ — отправим)
+                // 🏠 получаем данные комнаты
+                const roomRes = await db.query(
+                    `
+                    SELECT
+                        id,
+                        name,
+                        level,
+                        roles
+                    FROM rooms
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
+                    [ws.roomId]
+                );
+
+                if (roomRes.rows.length === 0) {
+                    return ws.send(JSON.stringify({
+                        type: "invite_failed",
+                        message: "Комната не найдена"
+                    }));
+                }
+
+                const room = roomRes.rows[0];
+
+                // ищем WS приглашённого
                 const friendWs = [...wss.clients].find(
                     c => c.readyState === WebSocket.OPEN && c.userId === friendId
                 );
@@ -2358,17 +2382,23 @@ wss.on('connection', ws => {
                             username: ws.userData.username,
                             avatar_id: ws.userData.avatar_id
                         },
-                        room_id: ws.roomId
+                        room: {
+                            id: room.id,
+                            name: room.name,
+                            level: room.level,
+                            roles: room.roles
+                        }
                     }));
                 }
 
-                // всегда отвечаем приглашающему
+                // всегда отвечаем отправителю
                 ws.send(JSON.stringify({
                     type: "invite_sent",
                     to: friendId,
                     room_id: ws.roomId
                 }));
             }
+
             if (data.type === "get_user_friends") {
                 const targetUserId = Number(data.user_id);
                 if (!targetUserId) return;
