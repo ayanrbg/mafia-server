@@ -2162,29 +2162,42 @@ wss.on('connection', ws => {
                 const result = await db.query(
                     `
                     SELECT
-                        games_played,
-                        mafia_games,
-                        mafia_wins,
-                        peaceful_games,
-                        peaceful_wins
-                    FROM user_stats
-                    WHERE user_id = $1
+                        u.username,
+                        u.avatar_id,
+                        u.level,
+                        us.games_played,
+                        us.mafia_games,
+                        us.mafia_wins,
+                        us.peaceful_games,
+                        us.peaceful_wins
+                    FROM users u
+                    LEFT JOIN user_stats us ON us.user_id = u.id
+                    WHERE u.id = $1
+                    LIMIT 1
                     `,
                     [targetUserId]
                 );
 
+                if (result.rows.length === 0) return;
+
+                const r = result.rows[0];
+
                 ws.send(JSON.stringify({
                     type: "user_stats",
                     user_id: targetUserId,
-                    stats: result.rows[0] || {
-                        games_played: 0,
-                        mafia_games: 0,
-                        mafia_wins: 0,
-                        peaceful_games: 0,
-                        peaceful_wins: 0
+                    username: r.username,
+                    avatar_id: r.avatar_id,
+                    level: r.level,
+                    stats: {
+                        games_played: r.games_played || 0,
+                        mafia_games: r.mafia_games || 0,
+                        mafia_wins: r.mafia_wins || 0,
+                        peaceful_games: r.peaceful_games || 0,
+                        peaceful_wins: r.peaceful_wins || 0
                     }
                 }));
             }
+
                 
             if (data.type === "get_friend_requests") {
                 const result = await db.query(
