@@ -2180,7 +2180,7 @@ wss.on('connection', ws => {
                 const result = await db.query(
                     `
                     SELECT
-                        a.id,
+                        a.id AS avatar_id,
                         a.code,
                         a.price,
                         (ua.user_id IS NOT NULL) AS owned,
