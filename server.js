@@ -1655,21 +1655,63 @@ wss.on('connection', ws => {
 
             // Регистрация
             if (data.type === 'register') {
-                const res = await registerUser(data.username, data.password);
+                const { username, password, password_confirm } = data;
+
+                // 1️⃣ базовая проверка
+                if (!username || !password || !password_confirm) {
+                    return ws.send(JSON.stringify({
+                        type: 'register_failed',
+                        message: 'Заполните все поля'
+                    }));
+                }
+
+                // 2️⃣ проверка совпадения паролей
+                if (password !== password_confirm) {
+                    return ws.send(JSON.stringify({
+                        type: 'register_failed',
+                        message: 'Пароли не совпадают'
+                    }));
+                }
+
+                const res = await registerUser(username, password);
 
                 if (res?.error === 'USERNAME_TAKEN') {
                     ws.send(JSON.stringify({
                         type: 'register_failed',
-                        message: 'Логин уже занят'
+                        message: 'Данный логин занят'
                     }));
                 }
                 else if (res) {
+                    const userId = res.user.id;
+                    const token = res.token;
+
+                    // 1️⃣ register_success
                     ws.send(JSON.stringify({
                         type: 'register_success',
-                        token: res.token,
-                        userId: res.user.id
+                        token,
+                        userId
                     }));
+
+                    // 2️⃣ считаем пользователя авторизованным
+                    ws.userId = userId;
+                    ws.token = token;
+
+                    const userData = await getUserData(userId);
+                    ws.username = userData.username;
+                    ws.userData = userData;
+                    ws.avatar_id = userData.avatar_id;
+
+                    // 3️⃣ auth_success (КАК ПРИ ЛОГИНЕ)
+                    ws.send(JSON.stringify({
+                        type: 'auth_success',
+                        userId,
+                        userData
+                    }));
+
+                    // 4️⃣ продлеваем токен (на всякий случай)
+                    await refreshToken(token);
                 }
+
                 else {
                     ws.send(JSON.stringify({
                         type: 'register_failed',
@@ -1677,6 +1719,7 @@ wss.on('connection', ws => {
                     }));
                 }
             }
+
 
             // Логин
             if (data.type === 'login') {
