@@ -2242,7 +2242,7 @@ wss.on('connection', ws => {
 
             if (data.type === "change_avatar") {
                 const avatarId = Number(data.avatar_id);
-                if (!avatarId) return;
+                if (Number.isNaN(avatarId)) return;
 
                 // 1️⃣ проверяем аватар
                 const avatarRes = await db.query(
