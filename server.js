@@ -962,6 +962,27 @@ function handleNightAction(userId, targetId) {
     const ws = [...wss.clients].find(c => c.userId === userId);
     registerVote(player.roomId, voteType, userId, targetId, ws);
 }
+async function sendAvatarShop(ws, userId) {
+    const result = await db.query(`
+        SELECT
+            a.id AS avatar_id,
+            a.code,
+            a.price,
+            (ua.user_id IS NOT NULL) AS owned,
+            (u.avatar_id = a.id) AS selected
+        FROM avatars a
+        CROSS JOIN users u
+        LEFT JOIN user_avatars ua
+            ON ua.avatar_id = a.id AND ua.user_id = $1
+        WHERE u.id = $1
+        ORDER BY a.id
+    `, [userId]);
+
+    ws.send(JSON.stringify({
+        type: "avatar_shop",
+        avatars: result.rows
+    }));
+}
 
 function startPhaseTimer(roomId, phase, durationSeconds) {
     const game = games[roomId];
@@ -2183,12 +2204,11 @@ wss.on('connection', ws => {
                 const avatarId = Number(data.avatar_id);
                 if (!avatarId) return;
 
-                // 1️⃣ получаем аватар
+                // 1️⃣ проверяем аватар
                 const avatarRes = await db.query(
-                    `SELECT id, price FROM avatars WHERE id = $1`,
+                    `SELECT price FROM avatars WHERE id = $1`,
                     [avatarId]
                 );
-
                 if (avatarRes.rows.length === 0) {
                     return ws.send(JSON.stringify({
                         type: "change_avatar_failed",
@@ -2196,94 +2216,44 @@ wss.on('connection', ws => {
                     }));
                 }
 
-                const avatar = avatarRes.rows[0];
-
-                // 2️⃣ получаем пользователя
+                // 2️⃣ проверяем деньги
                 const userRes = await db.query(
-                    `SELECT balance, avatar_id FROM users WHERE id = $1`,
+                    `SELECT balance FROM users WHERE id = $1`,
                     [ws.userId]
                 );
-
-                const user = userRes.rows[0];
-
-                // уже выбран
-                if (user.avatar_id === avatarId) {
-                    return ws.send(JSON.stringify({
-                        type: "change_avatar_failed",
-                        message: "Этот аватар уже выбран"
-                    }));
-                }
-
-                // 3️⃣ хватает ли денег
-                if (user.balance < avatar.price) {
+                const price = avatarRes.rows[0].price;
+                if (userRes.rows[0].balance < price) {
                     return ws.send(JSON.stringify({
                         type: "change_avatar_failed",
                         message: "Недостаточно средств"
                     }));
                 }
 
-                // 4️⃣ списываем деньги + меняем аватар
-                await db.query(
-                    `
+                // 3️⃣ списываем деньги и ставим аватар
+                await db.query(`
                     UPDATE users
-                    SET
-                        balance = balance - $1,
-                        avatar_id = $2
+                    SET avatar_id = $1,
+                        balance = balance - $2
                     WHERE id = $3
-                    `,
-                    [avatar.price, avatarId, ws.userId]
-                );
+                `, [avatarId, price, ws.userId]);
 
-                // (опционально) сохраняем, что аватар куплен
-                await db.query(
-                    `
+                // 4️⃣ сохраняем покупку
+                await db.query(`
                     INSERT INTO user_avatars (user_id, avatar_id)
                     VALUES ($1, $2)
                     ON CONFLICT DO NOTHING
-                    `,
-                    [ws.userId, avatarId]
-                );
+                `, [ws.userId, avatarId]);
 
-                // 5️⃣ отправляем ОБНОВЛЁННЫЕ user_stats
-                const statsRes = await db.query(
-                    `
-                    SELECT
-                        u.username,
-                        u.avatar_id,
-                        u.level,
-                        u.balance,
-                        us.games_played,
-                        us.mafia_games,
-                        us.mafia_wins,
-                        us.peaceful_games,
-                        us.peaceful_wins
-                    FROM users u
-                    LEFT JOIN user_stats us ON us.user_id = u.id
-                    WHERE u.id = $1
-                    `,
-                    [ws.userId]
-                );
-
-                const r = statsRes.rows[0];
-
-                ws.avatar_id = r.avatar_id; // 🔥 важно, чтобы чат сразу слал новый аватар
-
+                // 5️⃣ ответ об успехе
                 ws.send(JSON.stringify({
-                    type: "user_stats",
-                    user_id: ws.userId,
-                    username: r.username,
-                    avatar_id: r.avatar_id,
-                    level: r.level,
-                    balance: r.balance,
-                    stats: {
-                        games_played: r.games_played || 0,
-                        mafia_games: r.mafia_games || 0,
-                        mafia_wins: r.mafia_wins || 0,
-                        peaceful_games: r.peaceful_games || 0,
-                        peaceful_wins: r.peaceful_wins || 0
-                    }
+                    type: "change_avatar_success",
+                    avatar_id: avatarId
                 }));
+
+                // 6️⃣ 🔥 СРАЗУ ОТПРАВЛЯЕМ ОБНОВЛЁННЫЙ МАГАЗИН
+                await sendAvatarShop(ws, ws.userId);
             }
+
 
             if (data.type === "get_user_stats") {
                 const targetUserId = Number(data.user_id);
