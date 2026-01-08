@@ -1440,6 +1440,46 @@ async function finishGame(roomId) {
 
     delete games[roomId];
 }
+async function sendUserStats(ws, targetUserId) {
+    const result = await db.query(
+        `
+        SELECT
+            u.username,
+            u.avatar_id,
+            u.level,
+            us.games_played,
+            us.mafia_games,
+            us.mafia_wins,
+            us.peaceful_games,
+            us.peaceful_wins
+        FROM users u
+        LEFT JOIN user_stats us ON us.user_id = u.id
+        WHERE u.id = $1
+        LIMIT 1
+        `,
+        [targetUserId]
+    );
+
+    if (result.rows.length === 0) return;
+
+    const r = result.rows[0];
+
+    ws.send(JSON.stringify({
+        type: "user_stats",
+        user_id: targetUserId,
+        username: r.username,
+        avatar_id: r.avatar_id,
+        level: r.level,
+        stats: {
+            games_played: r.games_played || 0,
+            mafia_games: r.mafia_games || 0,
+            mafia_wins: r.mafia_wins || 0,
+            peaceful_games: r.peaceful_games || 0,
+            peaceful_wins: r.peaceful_wins || 0
+        }
+    }));
+}
+
 async function restoreGameState(ws) {
     if (!ws.roomId) return;
 
@@ -2244,14 +2284,18 @@ wss.on('connection', ws => {
                     ON CONFLICT DO NOTHING
                 `, [ws.userId, avatarId]);
 
-                // 5️⃣ ответ об успехе
+                // 5️⃣ успех
                 ws.send(JSON.stringify({
                     type: "change_avatar_success",
                     avatar_id: avatarId
                 }));
 
-                // 6️⃣ 🔥 СРАЗУ ОТПРАВЛЯЕМ ОБНОВЛЁННЫЙ МАГАЗИН
+                // 6️⃣ 🔥 ОБНОВЛЁННЫЕ СТАТЫ ПОЛЬЗОВАТЕЛЯ
+                await sendUserStats(ws, ws.userId);
+
+                // 7️⃣ 🔥 ОБНОВЛЁННЫЙ МАГАЗИН
                 await sendAvatarShop(ws, ws.userId);
+
             }
 
 
