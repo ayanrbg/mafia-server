@@ -9,6 +9,7 @@ const roomStartTimers = {}; // roomId -> timeout
 const DAY_DURATION = 20;   // секунды для дня
 const NIGHT_DURATION = 30; // секунды для ночи
 const PHASE_TICK_INTERVAL = 5000; // 5 секунд
+const TOKEN_TTL_MS = 20 * 60 * 1000; // 20 минут
 
 
 //#region Authorization
@@ -43,7 +44,7 @@ async function verifyToken(token) {
 
 // Авто-продление токена на 15 минут
 async function refreshToken(token) {
-    const newExpiry = new Date(Date.now() + 15 * 60 * 1000); // +15 минут
+    const newExpiry = new Date(Date.now() + TOKEN_TTL_MS); // +15 минут
     await db.query('UPDATE tokens SET expires_at=$1 WHERE token=$2', [newExpiry, token]);
 }
 
@@ -69,7 +70,7 @@ async function registerUser(username, password) {
 
 
         const token = generateToken();
-        const expires = new Date(Date.now() + 15 * 60 * 1000);
+        const expires = new Date(Date.now() + TOKEN_TTL_MS);
 
         await db.query(
             'INSERT INTO tokens(user_id, token, expires_at) VALUES($1, $2, $3)',
@@ -103,7 +104,7 @@ async function loginUser(username, password) {
 
     // создаём токен
     const token = generateToken();
-    const expires = new Date(Date.now() + 15 * 60 * 1000); // 15 минут
+    const expires = new Date(Date.now() + TOKEN_TTL_MS); // 15 минут
     await db.query('INSERT INTO tokens(user_id, token, expires_at) VALUES($1, $2, $3)', [user.id, token, expires]);
 
     return token;
@@ -378,7 +379,8 @@ const DAY_RESULTS_DURATION = 5; // задержка для показа итог
 
 function startDayVoting(roomId) {
     const game = games[roomId];
-    if (!game) return;
+    if (!game || game.isFinished) return;
+
     game.votes.day = {};
     if (game.timer) clearTimeout(game.timer);
 
@@ -400,7 +402,8 @@ function startDayVoting(roomId) {
 
 async function startDay(roomId) {
     const game = games[roomId];
-    if (!game) return;
+    if (!game || game.isFinished) return;
+
 
     game.dayBlocked = [];
 
@@ -652,15 +655,21 @@ for (const [fromUserId, targetUserId] of Object.entries(game.votes.day)) {
     game.votes.day = {};
     resetVotes(roomId);
     
-    checkWinCondition(roomId);
-    // через небольшую задержку запускаем ночь
-    game.timer = setTimeout(() => startNight(roomId), DAY_RESULTS_DURATION * 1000);
+    const finished = checkWinCondition(roomId);
+    if (finished) return;
+
+    game.timer = setTimeout(
+        () => startNight(roomId),
+        DAY_RESULTS_DURATION * 1000
+    );
+
 }
 
 async function startNight(roomId) {
     
     const game = games[roomId];
-    if (!game) return;
+    if (!game || game.isFinished) return;
+
 
     resetVotes(roomId);
     
@@ -751,6 +760,7 @@ async function tryStartGame(userId) {
         phase: "day",
         timer: null,
         dayNumber: 1,
+        isFinished: false,
         players: assignedRoles.map(p => ({
             user_id: p.user_id,
             username: p.username,
@@ -1289,10 +1299,12 @@ if (healedPlayerId) {
     });
 
     resetVotes(roomId);
-    checkWinCondition(roomId);
+    const finished = checkWinCondition(roomId);
+    if (finished) return;
 
     game.dayNumber++;
     setTimeout(() => startDay(roomId), 4000);
+
 }
 
 
@@ -1352,7 +1364,7 @@ function resetVotes(roomId) {
 
 function checkWinCondition(roomId) {
     const game = games[roomId];
-    if (!game) return;
+    if (!game || game.isFinished) return false;
 
     const alive = game.players.filter(p => p.is_alive);
     const aliveMafia = alive.filter(p => p.role === "mafia").length;
@@ -1360,22 +1372,19 @@ function checkWinCondition(roomId) {
 
     let winner = null;
 
-    // ✅ Победа мафии
     if (aliveMafia >= alivePeaceful && aliveMafia > 0) {
         winner = "mafia";
     }
 
-    // ✅ Победа мирных
     if (aliveMafia === 0 && alive.length > 0) {
         winner = "peaceful";
     }
 
-    if (!winner) return; // игра продолжается
+    if (!winner) return false;
 
-    // ✅ Отправляем всем результат
     broadcastToRoom(roomId, {
         type: "game_over",
-        winner, // "mafia" или "peaceful"
+        winner,
         players: game.players.map(p => ({
             user_id: p.user_id,
             username: p.username,
@@ -1385,61 +1394,59 @@ function checkWinCondition(roomId) {
         }))
     });
 
-    // ✅ Завершаем игру
-    finishGame(roomId);
+    finishGame(roomId, winner);
+    return true;
 }
-async function finishGame(roomId) {
-    stopPhaseTimer(roomId);
 
+async function finishGame(roomId, winner) {
     const game = games[roomId];
-    if (!game) return;
+    if (!game || game.isFinished) return;
 
+    game.isFinished = true;
+
+    stopPhaseTimer(roomId);
     clearTimeout(game.timer);
 
-    // ✅ Сбрасываем комнату в БД
     await db.query(
         `UPDATE rooms SET game_started=FALSE, phase='lobby' WHERE id=$1`,
         [roomId]
     );
 
-    // ✅ Сбрасываем игроков
     await db.query(
         `UPDATE room_players SET role=NULL, is_alive=TRUE WHERE room_id=$1`,
         [roomId]
     );
 
-    // ✅ Полностью удаляем игру из памяти
-
     for (const p of game.players) {
-    const isMafia = p.role === "mafia";
-    const isWinner =
-        (winner === "mafia" && isMafia) ||
-        (winner === "peaceful" && !isMafia);
+        const isMafia = p.role === "mafia";
+        const isWinner =
+            (winner === "mafia" && isMafia) ||
+            (winner === "peaceful" && !isMafia);
 
-    await db.query(
-        `
-        UPDATE user_stats
-        SET
-            games_played = games_played + 1,
-            mafia_games = mafia_games + $2,
-            mafia_wins = mafia_wins + $3,
-            peaceful_games = peaceful_games + $4,
-            peaceful_wins = peaceful_wins + $5
-        WHERE user_id = $1
-        `,
-        [
-            p.user_id,
-            isMafia ? 1 : 0,
-            isMafia && isWinner ? 1 : 0,
-            !isMafia ? 1 : 0,
-            !isMafia && isWinner ? 1 : 0
-        ]
-    );
-}
-
+        await db.query(
+            `
+            UPDATE user_stats
+            SET
+                games_played = games_played + 1,
+                mafia_games = mafia_games + $2,
+                mafia_wins = mafia_wins + $3,
+                peaceful_games = peaceful_games + $4,
+                peaceful_wins = peaceful_wins + $5
+            WHERE user_id = $1
+            `,
+            [
+                p.user_id,
+                isMafia ? 1 : 0,
+                isMafia && isWinner ? 1 : 0,
+                !isMafia ? 1 : 0,
+                !isMafia && isWinner ? 1 : 0
+            ]
+        );
+    }
 
     delete games[roomId];
 }
+
 async function sendUserStats(ws, targetUserId) {
     const result = await db.query(
         `
